@@ -97,8 +97,8 @@ Client (OpenAI style)
    - `SD_API_KEY`（必需）
    - `GATEWAY_API_KEY`（必需）
    - `ENHANCE_OPENAI_API_KEY`（可选，推荐）
-   - `ENHANCE_OPENAI_BASE_URL`（可选）
-   - `ENHANCE_OPENAI_MODEL`（可选）
+   - `ENHANCE_OPENAI_BASE_URL`（可选，推荐）
+   - `ENHANCE_OPENAI_MODEL`（可选，推荐）
 4. 点击 **Deploy** 一键部署 ✅
 
 部署完成后，你会得到一个类似：
