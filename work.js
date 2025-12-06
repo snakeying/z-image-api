@@ -94,6 +94,10 @@ const ASPECT_RATIO_MAP = {
 
 function detectAspectFromPrompt(prompt) {
   if (!prompt || typeof prompt !== 'string') return null;
+  
+  // 只有包含触发词时才检测比例
+  if (!/(?:比例|ratio)/i.test(prompt)) return null;
+  
   const normalized = prompt.replace(/：/g, ':');
   const ratios = Object.keys(ASPECT_RATIO_MAP);
 
@@ -116,8 +120,9 @@ function stripAspectFromPrompt(prompt, ratio) {
 // 决定最终 width/height
 function resolveSize(body, ratio) {
   if (typeof body.width === 'number' && typeof body.height === 'number') {
-    const w = Math.min(2048, Math.max(64, Math.round(body.width)));
-    const h = Math.min(2048, Math.max(64, Math.round(body.height)));
+    // 对齐到 8 的倍数
+    const w = Math.min(2048, Math.max(64, Math.round(body.width / 8) * 8));
+    const h = Math.min(2048, Math.max(64, Math.round(body.height / 8) * 8));
     return { width: w, height: h };
   }
 
@@ -161,16 +166,9 @@ async function handleChatCompletions(request, env) {
       ? body.cfg
       : 7.0;
 
-  let seed;
-  if (body.seed !== undefined && body.seed !== null && body.seed !== '') {
-    const parsed = Number(body.seed);
-    if (!Number.isNaN(parsed) && Number.isFinite(parsed)) {
-      seed = Math.floor(parsed);
-    }
-  }
-  if (typeof seed !== 'number') {
-    seed = Math.floor(Math.random() * 2_147_483_647);
-  }
+  const seed = (body.seed != null && Number.isFinite(Number(body.seed)))
+    ? Math.floor(Number(body.seed))
+    : Math.floor(Math.random() * 2_147_483_647);
 
   const negativePrompt =
     typeof body.negative_prompt === 'string' ? body.negative_prompt : undefined;
