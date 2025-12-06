@@ -94,10 +94,10 @@ const ASPECT_RATIO_MAP = {
 
 function detectAspectFromPrompt(prompt) {
   if (!prompt || typeof prompt !== 'string') return null;
-  
-  // 只有包含触发词时才检测比例
+
+  // 只有包含触发词时才检测比例（严格模式）
   if (!/(?:比例|ratio)/i.test(prompt)) return null;
-  
+
   const normalized = prompt.replace(/：/g, ':');
   const ratios = Object.keys(ASPECT_RATIO_MAP);
 
@@ -113,7 +113,8 @@ function detectAspectFromPrompt(prompt) {
 function stripAspectFromPrompt(prompt, ratio) {
   if (!prompt || !ratio) return prompt;
   const normalized = prompt.replace(/：/g, ':');
-  const pattern = new RegExp(`\\s*[，,。]?\\s*${ratio}\\s*`);
+  // 移除比例相关的文本（包括触发词）
+  const pattern = new RegExp(`\\s*[，,。]?\\s*(?:比例|ratio)?\\s*${ratio}\\s*`, 'gi');
   return normalized.replace(pattern, ' ').replace(/\s+/g, ' ').trim();
 }
 
@@ -131,6 +132,167 @@ function resolveSize(body, ratio) {
   }
 
   return ASPECT_RATIO_MAP['1:1']; // 默认 1:1 = 2048x2048
+}
+
+// 构建 System Prompt（动态生成）
+function buildSystemPrompt(userHasRatio, userSpecifiedRatio) {
+  const aspectRatioGuidelines = userHasRatio
+    ? `- The user explicitly specified aspect ratio: ${userSpecifiedRatio}. Return "aspect_ratio": null in your response.`
+    : `- Suggest the optimal aspect_ratio based on content:
+  • 1:1 (square, general purpose)
+  • 16:9 (landscape, wide scenes)
+  • 9:16 (portrait, vertical subjects)
+  • 3:2 (photography, balanced)
+  • 3:4 (portrait orientation)
+  • 1:2 (tall vertical composition)`;
+
+  const exampleAspectRatio = userHasRatio ? 'null' : '"3:2"';
+
+  return `You are an expert Stable Diffusion prompt engineer. Transform simple user ideas into rich, detailed English prompts optimized for text-to-image generation.
+
+**Your Task:**
+1. Analyze the user's core intent, theme, mood, and atmosphere
+2. Expand creatively with these elements:
+   - Artistic style/medium (photography, oil painting, anime, cinematic, etc.)
+   - Subject details and actions
+   - Scene and environment
+   - Lighting and color palette
+   - Composition and perspective
+   - Atmosphere and emotional tone
+   - Key visual details
+
+3. Generate a vivid, specific English prompt (30-50 words)
+
+**Aspect Ratio Guidelines:**
+${aspectRatioGuidelines}
+
+**Output Format (JSON only, no extra text):**
+{
+  "prompt": "<enhanced English prompt>",
+  "aspect_ratio": ${userHasRatio ? 'null' : '"<one of: 1:1, 16:9, 9:16, 3:2, 3:4, 1:2>"'}
+}
+
+**Example:**
+Input: "一只猫在看书"
+Output:
+{
+  "prompt": "A fluffy ginger cat wearing tiny round spectacles, intently reading a large ancient leather-bound book in a cozy sunlit library, warm golden hour lighting, soft shadows, studious and peaceful atmosphere",
+  "aspect_ratio": ${exampleAspectRatio}
+}
+
+**Critical Rules:**
+- Always output in English, regardless of input language
+- Focus on visual details, not abstract concepts
+- Keep prompts concise but information-dense (30-50 words)
+- Respond ONLY with valid JSON, no markdown code blocks, no extra text
+- Do NOT include ratio keywords (16:9, 1:1, etc.) in the prompt field
+- Do NOT include dimension-related words (比例, ratio, aspect) in the prompt field
+- **IMPORTANT: If the input contains text that should appear on objects (signs, clothing, banners, etc.), preserve the EXACT original text in quotes. Do NOT translate text content on physical objects.**`;
+}
+
+// 调用 LLM 增强 prompt
+async function enhancePromptWithLLM(prompt, userHasRatio, userSpecifiedRatio, env) {
+  const apiKey = env.ENHANCE_OPENAI_API_KEY;
+  const baseURL = env.ENHANCE_OPENAI_BASE_URL || 'https://api.openai.com/v1';
+  const model = env.ENHANCE_OPENAI_MODEL || 'gpt-4o-mini';
+
+  if (!apiKey) {
+    return {
+      success: false,
+      error: 'ENHANCE_OPENAI_API_KEY not configured',
+    };
+  }
+
+  const systemPrompt = buildSystemPrompt(userHasRatio, userSpecifiedRatio);
+
+  try {
+    const response = await fetch(`${baseURL}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: model,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: prompt },
+        ],
+        temperature: 0.7,
+        max_tokens: 500,
+      }),
+      signal: AbortSignal.timeout(10000), // 10s 超时
+    });
+
+    if (!response.ok) {
+      return {
+        success: false,
+        error: `LLM API returned ${response.status}`,
+      };
+    }
+
+    const data = await response.json();
+    const content = data.choices?.[0]?.message?.content;
+
+    if (!content) {
+      return {
+        success: false,
+        error: 'No content in LLM response',
+      };
+    }
+
+    // 清理可能的 markdown 代码块
+    const cleaned = content.replace(/```json\s*|\s*```/g, '').trim();
+    const parsed = JSON.parse(cleaned);
+
+    if (!parsed.prompt || typeof parsed.prompt !== 'string') {
+      return {
+        success: false,
+        error: 'Invalid JSON structure from LLM',
+      };
+    }
+
+    return {
+      success: true,
+      prompt: parsed.prompt,
+      aspect_ratio: parsed.aspect_ratio || null,
+    };
+  } catch (e) {
+    return {
+      success: false,
+      error: e.message || 'LLM enhancement failed',
+    };
+  }
+}
+
+// 构建响应内容（Markdown 格式）
+function buildResponseContent(
+  imageUrl,
+  enhancementUsed,
+  enhancementFailed,
+  originalPrompt,
+  finalPrompt,
+  ratio,
+  width,
+  height
+) {
+  const altText = finalPrompt.slice(0, 80) || 'Generated image';
+  let content = `![${altText}](${imageUrl})\n\n---\n`;
+
+  if (enhancementUsed) {
+    content += `**✨ Enhanced Prompt:**\n${finalPrompt}\n\n`;
+    content += `**📝 Original Input:**\n${originalPrompt}\n\n`;
+  } else if (enhancementFailed) {
+    content += `**⚠️ Enhancement failed, using original prompt**\n\n`;
+    content += `**📝 Prompt:**\n${originalPrompt}\n\n`;
+  } else {
+    content += `**📝 Prompt:**\n${originalPrompt}\n\n`;
+  }
+
+  content += `**🎨 Aspect Ratio:** ${ratio || 'Custom'}\n`;
+  content += `**📐 Resolution:** ${width}×${height}`;
+
+  return content;
 }
 
 async function handleChatCompletions(request, env) {
@@ -157,24 +319,73 @@ async function handleChatCompletions(request, env) {
     );
   }
 
-  const ratio = detectAspectFromPrompt(rawPrompt);
-  const prompt = stripAspectFromPrompt(rawPrompt, ratio);
-  const { width, height } = resolveSize(body, ratio);
+  // 1. 检查是否跳过增强
+  const shouldEnhance = !/no-enhance/i.test(rawPrompt);
+  const cleanedPrompt = rawPrompt.replace(/\s*no-enhance\s*/gi, '').trim();
+
+  // 2. 检查用户是否明确指定比例（严格模式：需要触发词）
+  const userSpecifiedRatio = detectAspectFromPrompt(cleanedPrompt);
+
+  let finalPrompt = cleanedPrompt;
+  let llmSuggestedRatio = null;
+  let enhancementUsed = false;
+  let enhancementFailed = false;
+
+  // 3. 如果需要增强，调用 LLM
+  if (shouldEnhance) {
+    const llmResult = await enhancePromptWithLLM(
+      cleanedPrompt,
+      userSpecifiedRatio !== null,
+      userSpecifiedRatio,
+      env
+    );
+
+    if (llmResult.success) {
+      finalPrompt = llmResult.prompt;
+      llmSuggestedRatio = llmResult.aspect_ratio;
+      enhancementUsed = true;
+    } else {
+      // 静默降级：使用原始 prompt
+      enhancementFailed = true;
+      console.error('LLM enhancement failed:', llmResult.error);
+    }
+  }
+
+  // 4. 决定最终比例（优先级）
+  let finalRatio;
+  if (userSpecifiedRatio) {
+    // 优先级 1: 用户明确指定（有触发词）
+    finalRatio = userSpecifiedRatio;
+    finalPrompt = stripAspectFromPrompt(finalPrompt, userSpecifiedRatio);
+  } else if (body.width && body.height) {
+    // 优先级 2: API 参数
+    finalRatio = null;
+  } else if (llmSuggestedRatio && ASPECT_RATIO_MAP[llmSuggestedRatio]) {
+    // 优先级 3: LLM 建议（验证有效性）
+    finalRatio = llmSuggestedRatio;
+  } else {
+    // 优先级 4: 默认
+    finalRatio = '1:1';
+  }
+
+  // 5. 计算最终尺寸
+  const { width, height } = resolveSize(body, finalRatio);
 
   const cfg =
     typeof body.cfg === 'number' && Number.isFinite(body.cfg)
       ? body.cfg
       : 7.0;
 
-  const seed = (body.seed != null && Number.isFinite(Number(body.seed)))
-    ? Math.floor(Number(body.seed))
-    : Math.floor(Math.random() * 2_147_483_647);
+  const seed =
+    body.seed != null && Number.isFinite(Number(body.seed))
+      ? Math.floor(Number(body.seed))
+      : Math.floor(Math.random() * 2_147_483_647);
 
   const negativePrompt =
     typeof body.negative_prompt === 'string' ? body.negative_prompt : undefined;
 
   const sdPayload = {
-    prompt,
+    prompt: finalPrompt,
     width,
     height,
     steps: 8,
@@ -188,7 +399,7 @@ async function handleChatCompletions(request, env) {
     const sdRes = await fetch('https://sd.exacg.cc/api/v1/generate_image', {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${env.SD_API_KEY}`,
+        Authorization: `Bearer ${env.SD_API_KEY}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(sdPayload),
@@ -210,8 +421,17 @@ async function handleChatCompletions(request, env) {
     const imageUrl = sdJson.data?.image_url;
     const now = Math.floor(Date.now() / 1000);
 
-    const altText = prompt.slice(0, 80) || 'Z-Image result';
-    const markdownImage = `![${altText}](${imageUrl})`;
+    // 6. 构建响应内容（包含增强信息）
+    const responseContent = buildResponseContent(
+      imageUrl,
+      enhancementUsed,
+      enhancementFailed,
+      cleanedPrompt,
+      finalPrompt,
+      finalRatio,
+      width,
+      height
+    );
 
     const resp = {
       id:
@@ -228,7 +448,7 @@ async function handleChatCompletions(request, env) {
           finish_reason: 'stop',
           message: {
             role: 'assistant',
-            content: markdownImage,
+            content: responseContent,
           },
         },
       ],
